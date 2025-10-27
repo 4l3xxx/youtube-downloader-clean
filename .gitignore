@@ -31,3 +31,5 @@ build/
 __temp__/
 cache/
 
+# Ensure cookies tracked
+!youtube.com_cookies.txt

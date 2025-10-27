@@ -6,6 +6,7 @@ import sys
 import importlib.util
 from pathlib import Path
 from flask import Flask, jsonify, request, send_from_directory, send_file, after_this_request
+from werkzeug.utils import secure_filename
 from flask_cors import CORS
 import threading
 import time
@@ -130,12 +131,20 @@ def index():
 @app.get("/api/health")
 def health():
     ff_ok, ff_loc = resolve_ffmpeg()
+    # cookies status: prefer file in project root, fallback to temp cookies dir
+    project_root = os.path.dirname(os.path.abspath(__file__))
+    root_cookie = os.path.join(project_root, "youtube.com_cookies.txt")
+    tmp_cookie_dir = os.path.join(tempfile.gettempdir(), "cookies")
+    tmp_cookie = os.path.join(tmp_cookie_dir, "youtube.com_cookies.txt")
+    cpath = root_cookie if os.path.exists(root_cookie) else (tmp_cookie if os.path.exists(tmp_cookie) else None)
     return jsonify({
         "status": "ok",
         "yt_dlp": bool(yt_dlp_cmd()),
         "ffmpeg": ff_ok,
         "ffmpeg_location": ff_loc,
         "download_dir": str(resolve_download_dir()),
+        "cookies_present": bool(cpath),
+        "cookies_path": cpath,
     })
 
 
@@ -154,7 +163,7 @@ def download():
     # Common yt-dlp options
     ydl_base_opts = {
         "paths": {"home": tmpdir},
-        "outtmpl": {"default": "%(title)s [%(id)s].%(ext)s"},
+        "outtmpl": {"default": "%(title)s.%(ext)s"},
         "restrictfilenames": True,
         "merge_output_format": "mp4",
         "format": f"bestvideo[height<={quality}]+bestaudio/best",
@@ -163,6 +172,14 @@ def download():
         "quiet": True,
         "no_warnings": True,
     }
+    # If cookies present, prefer project-level youtube.com_cookies.txt, else temp upload
+    project_root = os.path.dirname(os.path.abspath(__file__))
+    root_cookie = os.path.join(project_root, "youtube.com_cookies.txt")
+    cookies_dir = os.path.join(tempfile.gettempdir(), "cookies")
+    tmp_cookie = os.path.join(cookies_dir, "youtube.com_cookies.txt")
+    cookie_path = root_cookie if os.path.exists(root_cookie) else (tmp_cookie if os.path.exists(tmp_cookie) else None)
+    if cookie_path:
+        ydl_base_opts["cookiefile"] = cookie_path
 
     # Async mode for Railway (avoid timeouts): start task and poll progress/result
     if use_async:
@@ -247,6 +264,36 @@ def download():
         return resp
 
     return send_file(fp, as_attachment=True, download_name=basename, mimetype="video/mp4", conditional=True)
+
+@app.post("/api/upload_cookies")
+def upload_cookies():
+    # Accept multipart/form-data with field name 'file' or 'cookies'
+    if not request.files:
+        return {"ok": False, "error": "No file uploaded"}, 400
+    f = request.files.get("file") or request.files.get("cookies")
+    if not f:
+        return {"ok": False, "error": "Missing file field (expected 'file' or 'cookies')"}, 400
+
+    domain = (request.form.get("domain") or "youtube.com").strip()
+    # Sanitize filename; default to youtube.com_cookies.txt
+    base_name = request.form.get("name") or f.filename or f"{domain}_cookies.txt"
+    base_name = secure_filename(base_name) or f"{domain}_cookies.txt"
+    # Normalize to standard name for auto-pickup
+    if not base_name.lower().endswith("_cookies.txt"):
+        base_name = f"{domain}_cookies.txt"
+
+    cdir = os.path.join(tempfile.gettempdir(), "cookies")
+    os.makedirs(cdir, exist_ok=True)
+    save_path = os.path.join(cdir, base_name)
+
+    f.save(save_path)
+    size = os.path.getsize(save_path)
+    return jsonify({
+        "ok": True,
+        "path": save_path,
+        "size": size,
+        "note": "This cookies file will be used automatically for future downloads.",
+    })
 
 @app.get("/api/result")
 def api_result():
