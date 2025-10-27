@@ -156,6 +156,7 @@ def download():
         return {"ok": False, "error": "URL is required"}, 400
     quality = (data.get("quality") or "1080p").rstrip("p")
     use_async = bool(data.get("async"))
+    preferred_browser = (data.get("cookies_from_browser") or data.get("browser") or "").strip().lower() or None
 
     tmpdir = os.path.join(tempfile.gettempdir(), "ytdl")
     os.makedirs(tmpdir, exist_ok=True)
@@ -182,6 +183,31 @@ def download():
         ydl_base_opts["cookiefile"] = cookie_path
 
     # Async mode for Railway (avoid timeouts): start task and poll progress/result
+    # Helper: decide if error indicates login/cookies required
+    def _is_auth_error(err_msg: str) -> bool:
+        m = (err_msg or "").lower()
+        tokens = [
+            "sign in to confirm",
+            "please sign in",
+            "cookies",
+            "consent",
+            "verify you are",
+            "not a bot",
+            "access denied",
+        ]
+        return any(t in m for t in tokens)
+
+    # Helper: attempt download with optional cookies-from-browser
+    def _attempt_with_browser(browser: str | None, hook=None):
+        opts = dict(ydl_base_opts)
+        if hook:
+            opts["postprocessor_hooks"] = [hook]
+        if browser:
+            # yt-dlp expects tuple; minimal (browser,) works for most cases
+            opts["cookiesfrombrowser"] = (browser,)
+        with YoutubeDL(opts) as ydl:
+            ydl.extract_info(url, download=True)
+
     if use_async:
         task_id = str(int(time.time() * 1000))
         TASKS[task_id] = {
@@ -217,14 +243,41 @@ def download():
 
         def run():
             try:
-                opts = dict(ydl_base_opts)
-                opts["postprocessor_hooks"] = [hook]
-                with YoutubeDL(opts) as ydl:
-                    ydl.extract_info(url, download=True)
-                TASKS[task_id]["status"] = "completed"
-            except Exception as e:
-                TASKS[task_id]["status"] = "error"
-                TASKS[task_id]["log"] = str(e)
+                # First attempt (no browser cookies if cookiefile already set)
+                try:
+                    _attempt_with_browser(None, hook)
+                    TASKS[task_id]["status"] = "completed"
+                    return
+                except Exception as e1:
+                    msg = str(e1)
+                    # Retry with cookies-from-browser if requested or auth-like error
+                    retry_browsers = []
+                    if preferred_browser:
+                        retry_browsers.append(preferred_browser)
+                    # simple OS-based guess if not provided
+                    if not retry_browsers and _is_auth_error(msg):
+                        sysname = platform.system().lower()
+                        if sysname.startswith("win"):
+                            retry_browsers = ["chrome", "edge", "firefox"]
+                        elif sysname == "darwin":
+                            retry_browsers = ["chrome", "safari", "firefox"]
+                        else:
+                            retry_browsers = ["chrome", "chromium", "firefox"]
+                    # Perform retries
+                    for b in retry_browsers:
+                        try:
+                            _attempt_with_browser(b, hook)
+                            TASKS[task_id]["status"] = "completed"
+                            TASKS[task_id]["log"] = f"Used cookies from browser: {b}"
+                            return
+                        except Exception as _:
+                            continue
+                    # If we reach here, fail with guidance
+                    TASKS[task_id]["status"] = "error"
+                    TASKS[task_id]["log"] = (
+                        msg
+                        + "\nHint: Provide cookies — upload cookies.txt via /api/upload_cookies or set 'cookies_from_browser' to 'chrome' or 'firefox'."
+                    )
 
         threading.Thread(target=run, daemon=True).start()
         return jsonify({"ok": True, "task_id": task_id})
@@ -237,10 +290,30 @@ def download():
             info = d.get("info_dict") or {}
             final["path"] = info.get("filepath")
 
-    opts = dict(ydl_base_opts)
-    opts["postprocessor_hooks"] = [pp_hook]
-    with YoutubeDL(opts) as ydl:
-        ydl.extract_info(url, download=True)
+    # Sync path with retry logic
+    try:
+        _attempt_with_browser(None, pp_hook)
+    except Exception as e1:
+        msg = str(e1)
+        retry_browsers = []
+        if preferred_browser:
+            retry_browsers.append(preferred_browser)
+        if not retry_browsers and _is_auth_error(msg):
+            sysname = platform.system().lower()
+            if sysname.startswith("win"):
+                retry_browsers = ["chrome", "edge", "firefox"]
+            elif sysname == "darwin":
+                retry_browsers = ["chrome", "safari", "firefox"]
+            else:
+                retry_browsers = ["chrome", "chromium", "firefox"]
+        for b in retry_browsers:
+            try:
+                _attempt_with_browser(b, pp_hook)
+                break
+            except Exception:
+                continue
+        else:
+            return {"ok": False, "error": msg + "\nPlease provide browser cookies (chrome/firefox) or upload cookies.txt."}, 400
 
     fp = final["path"]
     if not fp or not os.path.exists(fp):
