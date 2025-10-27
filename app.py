@@ -141,13 +141,78 @@ def health():
 
 @app.route("/api/download", methods=["POST"])
 def download():
-    data = request.get_json()
-    url = data["url"]
+    data = request.get_json() or {}
+    url = (data.get("url") or "").strip()
+    if not url:
+        return {"ok": False, "error": "URL is required"}, 400
     quality = (data.get("quality") or "1080p").rstrip("p")
+    use_async = bool(data.get("async"))
 
     tmpdir = os.path.join(tempfile.gettempdir(), "ytdl")
     os.makedirs(tmpdir, exist_ok=True)
 
+    # Common yt-dlp options
+    ydl_base_opts = {
+        "paths": {"home": tmpdir},
+        "outtmpl": {"default": "%(title)s [%(id)s].%(ext)s"},
+        "restrictfilenames": True,
+        "merge_output_format": "mp4",
+        "format": f"bestvideo[height<={quality}]+bestaudio/best",
+        # quieter logs in production
+        "noprogress": True,
+        "quiet": True,
+        "no_warnings": True,
+    }
+
+    # Async mode for Railway (avoid timeouts): start task and poll progress/result
+    if use_async:
+        task_id = str(int(time.time() * 1000))
+        TASKS[task_id] = {
+            "status": "starting",
+            "progress": 0,
+            "eta": None,
+            "speed": None,
+            "title": None,
+            "log": "",
+            "file": None,
+        }
+
+        def hook(d):
+            t = TASKS.get(task_id)
+            if not t:
+                return
+            st = d.get("status")
+            if st:
+                t["status"] = st
+            if st == "downloading":
+                total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+                downloaded = d.get("downloaded_bytes") or 0
+                t["progress"] = int(downloaded * 100 / total) if total else 0
+                t["eta"] = d.get("eta")
+                t["speed"] = d.get("speed")
+                t["title"] = d.get("info_dict", {}).get("title") or t.get("title")
+            if st == "finished":
+                info = d.get("info_dict") or {}
+                fp = info.get("filepath") or info.get("_filename")
+                if fp:
+                    t["file"] = fp
+                t["progress"] = 100
+
+        def run():
+            try:
+                opts = dict(ydl_base_opts)
+                opts["postprocessor_hooks"] = [hook]
+                with YoutubeDL(opts) as ydl:
+                    ydl.extract_info(url, download=True)
+                TASKS[task_id]["status"] = "completed"
+            except Exception as e:
+                TASKS[task_id]["status"] = "error"
+                TASKS[task_id]["log"] = str(e)
+
+        threading.Thread(target=run, daemon=True).start()
+        return jsonify({"ok": True, "task_id": task_id})
+
+    # Sync mode: download and stream file immediately
     final = {"path": None}
 
     def pp_hook(d):
@@ -155,16 +220,9 @@ def download():
             info = d.get("info_dict") or {}
             final["path"] = info.get("filepath")
 
-    ydl_opts = {
-        "paths": {"home": tmpdir},
-        "outtmpl": {"default": "%(title)s [%(id)s].%(ext)s"},
-        "restrictfilenames": True,
-        "merge_output_format": "mp4",
-        "format": f"bestvideo[height<={quality}]+bestaudio/best",
-        "postprocessor_hooks": [pp_hook],
-    }
-
-    with YoutubeDL(ydl_opts) as ydl:
+    opts = dict(ydl_base_opts)
+    opts["postprocessor_hooks"] = [pp_hook]
+    with YoutubeDL(opts) as ydl:
         ydl.extract_info(url, download=True)
 
     fp = final["path"]
@@ -182,8 +240,38 @@ def download():
 
     @after_this_request
     def _cleanup(resp):
-        try: os.remove(fp)
-        except Exception: pass
+        try:
+            os.remove(fp)
+        except Exception:
+            pass
+        return resp
+
+    return send_file(fp, as_attachment=True, download_name=basename, mimetype="video/mp4", conditional=True)
+
+@app.get("/api/result")
+def api_result():
+    tid = request.args.get("task")
+    t = TASKS.get(tid or "")
+    if not t:
+        return {"ok": False, "error": "task not found"}, 404
+    if t.get("status") != "completed":
+        return {"ok": False, "error": "task not completed"}, 400
+    fp = t.get("file")
+    if not fp or not os.path.exists(fp):
+        return {"ok": False, "error": "file not found"}, 404
+    basename = os.path.basename(fp)
+
+    @after_this_request
+    def _cleanup(resp):
+        try:
+            os.remove(fp)
+        except Exception:
+            pass
+        # Optionally clear task entry
+        try:
+            TASKS.pop(tid, None)
+        except Exception:
+            pass
         return resp
 
     return send_file(fp, as_attachment=True, download_name=basename, mimetype="video/mp4", conditional=True)

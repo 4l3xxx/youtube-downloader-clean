@@ -53,41 +53,75 @@ async function download(){
     return;
   }
   btn.disabled = true;
-  statusEl.textContent = 'Preparing download...';
+  statusEl.textContent = 'Starting job...';
   savedEl.textContent = '';
   errBox.removeAttribute('open');
   logEl.textContent = '';
   const pg = document.getElementById('progress');
-  pg.hidden = true;
+  const bar = document.getElementById('bar');
+  const meta = document.getElementById('meta');
+  pg.hidden = false; bar.style.width = '0%'; meta.textContent = '0% • ETA --s • -- MB/s';
   try{
+    // Start async job on the server to avoid host timeouts
     const r = await api('/api/download',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({url:u,quality:quality.value})
+      body:JSON.stringify({url:u,quality:quality.value,async:true})
     });
-    if(!r.ok){
-      let msg = 'Request failed.';
-      try{ const j = await r.json(); msg = j.error || j.output || msg; }catch{}
+    const j = await r.json().catch(()=>({ok:false,error:'Invalid JSON'}));
+    if(!r.ok || !j.ok || !j.task_id){
+      const msg = j.error || 'Failed to start job.';
       statusEl.innerHTML = `<span class="error">Failed.</span>`;
       savedEl.textContent = 'See error details below.';
       logEl.textContent = msg;
       errBox.setAttribute('open','');
       return;
     }
-    const cd = r.headers.get('Content-Disposition') || '';
-    let fname = 'video.mp4';
-    const m = /filename\*=UTF-8''([^;]+)|filename="?([^";]+)"?/i.exec(cd);
-    if(m){ fname = decodeURIComponent(m[1] || m[2] || fname); }
-    const blob = await r.blob();
-    const href = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = href;
-    a.download = fname;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(href);
-    statusEl.textContent = 'Download started. Check your Downloads.';
+    const task = j.task_id;
+    statusEl.textContent = 'Downloading...';
+    let done = false;
+    while(!done){
+      await new Promise(r=>setTimeout(r,1000));
+      let pr;
+      try{ const rr = await api(`/api/progress?task=${encodeURIComponent(task)}`); pr = await rr.json(); }
+      catch(e){ break; }
+      if(!pr || !pr.ok){ break; }
+      const pct = Math.max(0, Math.min(100, pr.progress||0));
+      bar.style.width = pct + '%';
+      const eta = pr.eta!=null ? pr.eta+'s' : '--s';
+      const spd = pr.speed ? (pr.speed/1048576).toFixed(2)+' MB/s' : '-- MB/s';
+      meta.textContent = `${pct}% • ETA ${eta} • ${spd}`;
+      if(pr.status === 'completed'){
+        done = true;
+        // Fetch the result file
+        const fr = await api(`/api/result?task=${encodeURIComponent(task)}`);
+        if(!fr.ok){
+          statusEl.innerHTML = `<span class="error">Failed to fetch file.</span>`;
+          try{ const jj = await fr.json(); logEl.textContent = jj.error || 'Unknown error'; errBox.setAttribute('open',''); }catch{}
+          break;
+        }
+        const cd = fr.headers.get('Content-Disposition') || '';
+        let fname = 'video.mp4';
+        const m = /filename\*=UTF-8''([^;]+)|filename="?([^";]+)"?/i.exec(cd);
+        if(m){ fname = decodeURIComponent(m[1] || m[2] || fname); }
+        const blob = await fr.blob();
+        const href = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = href;
+        a.download = fname;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(href);
+        statusEl.textContent = 'Done. Check your Downloads.';
+      } else if(pr.status === 'error'){
+        done = true;
+        statusEl.innerHTML = `<span class="error">Failed.</span>`;
+        savedEl.textContent = 'See error details below.';
+        logEl.textContent = pr.log || 'Unknown error';
+        errBox.setAttribute('open','');
+      }
+    }
   }catch(e){
     statusEl.innerHTML = `<span class="error">Failed.</span>`;
     savedEl.textContent = 'See error details below.';
