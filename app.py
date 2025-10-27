@@ -11,20 +11,24 @@ from flask_cors import CORS
 import threading
 import time
 import tempfile
-from yt_dlp import YoutubeDL
+# Import yt_dlp lazily to avoid startup crashes on platforms where
+# dependencies are not yet installed at import time.
+def get_YoutubeDL():
+    try:
+        from yt_dlp import YoutubeDL  # type: ignore
+        return YoutubeDL
+    except Exception as e:
+        raise RuntimeError(f"yt-dlp not available: {e}")
 
 
 def resolve_download_dir() -> Path:
     sysname = platform.system().lower()
     home = Path.home()
 
-    # Windows
     if sysname.startswith("win"):
         dl = Path(os.environ.get("USERPROFILE", str(home))) / "Downloads"
         return dl if dl.exists() else Path.cwd()
 
-    # Android via Termux
-    # Common Termux storage paths
     termux_dl = Path.home() / "storage" / "downloads"
     if termux_dl.exists():
         return termux_dl
@@ -32,7 +36,6 @@ def resolve_download_dir() -> Path:
     if sd_dl.exists():
         return sd_dl
 
-    # Linux/macOS default
     dl = home / "Downloads"
     return dl if dl.exists() else Path.cwd()
 
@@ -42,17 +45,12 @@ def bin_exists(name: str) -> bool:
 
 
 def resolve_ffmpeg():
-    """Return (ok, location) where location is a directory containing ffmpeg.
-    Checks PATH, env vars, and scans common Windows install locations.
-    """
     exe_name = "ffmpeg.exe" if platform.system().lower().startswith("win") else "ffmpeg"
 
-    # 1) PATH
     p = shutil.which("ffmpeg")
     if p:
         return True, os.path.dirname(p)
 
-    # 2) Environment variables
     for env in ("FFMPEG_LOCATION", "FFMPEG_BIN", "FFMPEG_PATH"):
         val = os.environ.get(env)
         if not val:
@@ -65,7 +63,6 @@ def resolve_ffmpeg():
             if exe.exists():
                 return True, str(path)
 
-    # 3) Known Windows locations (WinGet, Chocolatey, manual C:\ffmpeg, Program Files, Scoop)
     if platform.system().lower().startswith("win"):
         candidates = [
             Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "WinGet" / "Packages",
@@ -80,11 +77,9 @@ def resolve_ffmpeg():
             try:
                 if not root.exists():
                     continue
-                # Search shallow first
                 direct = root / exe_name
                 if direct.exists():
                     return True, str(root)
-                # Then recursive but bounded by depth via rglob
                 for hit in root.rglob(exe_name):
                     return True, str(hit.parent)
             except Exception:
@@ -101,10 +96,8 @@ def module_exists(name: str) -> bool:
 
 
 def yt_dlp_cmd():
-    # Prefer system binary if available
     if bin_exists("yt-dlp"):
         return ["yt-dlp"]
-    # Fallback to Python module (works if yt-dlp installed in current interpreter/venv)
     if module_exists("yt_dlp"):
         return [sys.executable, "-m", "yt_dlp"]
     return None
@@ -116,7 +109,6 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 
 @app.after_request
 def add_cors(resp):
-    # Allow using file:// opened index.html to call the API
     resp.headers.setdefault("Access-Control-Allow-Origin", "*")
     resp.headers.setdefault("Access-Control-Allow-Headers", "Content-Type")
     resp.headers.setdefault("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
@@ -131,7 +123,6 @@ def index():
 @app.get("/api/health")
 def health():
     ff_ok, ff_loc = resolve_ffmpeg()
-    # cookies status: prefer file in project root, fallback to temp cookies dir
     project_root = os.path.dirname(os.path.abspath(__file__))
     root_cookie = os.path.join(project_root, "youtube.com_cookies.txt")
     tmp_cookie_dir = os.path.join(tempfile.gettempdir(), "cookies")
@@ -161,19 +152,16 @@ def download():
     tmpdir = os.path.join(tempfile.gettempdir(), "ytdl")
     os.makedirs(tmpdir, exist_ok=True)
 
-    # Common yt-dlp options
     ydl_base_opts = {
         "paths": {"home": tmpdir},
         "outtmpl": {"default": "%(title)s.%(ext)s"},
         "restrictfilenames": True,
         "merge_output_format": "mp4",
         "format": f"bestvideo[height<={quality}]+bestaudio/best",
-        # quieter logs in production
         "noprogress": True,
         "quiet": True,
         "no_warnings": True,
     }
-    # If cookies present, prefer project-level youtube.com_cookies.txt, else temp upload
     project_root = os.path.dirname(os.path.abspath(__file__))
     root_cookie = os.path.join(project_root, "youtube.com_cookies.txt")
     cookies_dir = os.path.join(tempfile.gettempdir(), "cookies")
@@ -182,8 +170,6 @@ def download():
     if cookie_path:
         ydl_base_opts["cookiefile"] = cookie_path
 
-    # Async mode for Railway (avoid timeouts): start task and poll progress/result
-    # Helper: decide if error indicates login/cookies required
     def _is_auth_error(err_msg: str) -> bool:
         m = (err_msg or "").lower()
         tokens = [
@@ -197,14 +183,13 @@ def download():
         ]
         return any(t in m for t in tokens)
 
-    # Helper: attempt download with optional cookies-from-browser
     def _attempt_with_browser(browser: str | None, hook=None):
         opts = dict(ydl_base_opts)
         if hook:
             opts["postprocessor_hooks"] = [hook]
         if browser:
-            # yt-dlp expects tuple; minimal (browser,) works for most cases
             opts["cookiesfrombrowser"] = (browser,)
+        YoutubeDL = get_YoutubeDL()
         with YoutubeDL(opts) as ydl:
             ydl.extract_info(url, download=True)
 
@@ -243,18 +228,15 @@ def download():
 
         def run():
             try:
-                # First attempt (no browser cookies if cookiefile already set)
                 try:
                     _attempt_with_browser(None, hook)
                     TASKS[task_id]["status"] = "completed"
                     return
                 except Exception as e1:
                     msg = str(e1)
-                    # Retry with cookies-from-browser if requested or auth-like error
                     retry_browsers = []
                     if preferred_browser:
                         retry_browsers.append(preferred_browser)
-                    # simple OS-based guess if not provided
                     if not retry_browsers and _is_auth_error(msg):
                         sysname = platform.system().lower()
                         if sysname.startswith("win"):
@@ -263,26 +245,27 @@ def download():
                             retry_browsers = ["chrome", "safari", "firefox"]
                         else:
                             retry_browsers = ["chrome", "chromium", "firefox"]
-                    # Perform retries
                     for b in retry_browsers:
                         try:
                             _attempt_with_browser(b, hook)
                             TASKS[task_id]["status"] = "completed"
                             TASKS[task_id]["log"] = f"Used cookies from browser: {b}"
                             return
-                        except Exception as _:
+                        except Exception:
                             continue
-                    # If we reach here, fail with guidance
                     TASKS[task_id]["status"] = "error"
                     TASKS[task_id]["log"] = (
                         msg
-                        + "\nHint: Provide cookies — upload cookies.txt via /api/upload_cookies or set 'cookies_from_browser' to 'chrome' or 'firefox'."
+                        + "\nHint: Provide cookies — upload cookies.txt via /api/upload_cookies "
+                        + "or set 'cookies_from_browser' to 'chrome' or 'firefox'."
                     )
+            except Exception as e:
+                TASKS[task_id]["status"] = "error"
+                TASKS[task_id]["log"] = str(e)
 
         threading.Thread(target=run, daemon=True).start()
         return jsonify({"ok": True, "task_id": task_id})
 
-    # Sync mode: download and stream file immediately
     final = {"path": None}
 
     def pp_hook(d):
@@ -290,7 +273,6 @@ def download():
             info = d.get("info_dict") or {}
             final["path"] = info.get("filepath")
 
-    # Sync path with retry logic
     try:
         _attempt_with_browser(None, pp_hook)
     except Exception as e1:
@@ -338,9 +320,9 @@ def download():
 
     return send_file(fp, as_attachment=True, download_name=basename, mimetype="video/mp4", conditional=True)
 
+
 @app.post("/api/upload_cookies")
 def upload_cookies():
-    # Accept multipart/form-data with field name 'file' or 'cookies'
     if not request.files:
         return {"ok": False, "error": "No file uploaded"}, 400
     f = request.files.get("file") or request.files.get("cookies")
@@ -348,10 +330,8 @@ def upload_cookies():
         return {"ok": False, "error": "Missing file field (expected 'file' or 'cookies')"}, 400
 
     domain = (request.form.get("domain") or "youtube.com").strip()
-    # Sanitize filename; default to youtube.com_cookies.txt
     base_name = request.form.get("name") or f.filename or f"{domain}_cookies.txt"
     base_name = secure_filename(base_name) or f"{domain}_cookies.txt"
-    # Normalize to standard name for auto-pickup
     if not base_name.lower().endswith("_cookies.txt"):
         base_name = f"{domain}_cookies.txt"
 
@@ -367,6 +347,7 @@ def upload_cookies():
         "size": size,
         "note": "This cookies file will be used automatically for future downloads.",
     })
+
 
 @app.get("/api/result")
 def api_result():
@@ -387,7 +368,6 @@ def api_result():
             os.remove(fp)
         except Exception:
             pass
-        # Optionally clear task entry
         try:
             TASKS.pop(tid, None)
         except Exception:
@@ -399,11 +379,9 @@ def api_result():
 
 @app.get("/dl")
 def show_dl_path():
-    # Small helper to expose path info in UI
     return jsonify({"download_dir": str(resolve_download_dir())})
 
 
-# In-memory task store for async progress
 TASKS: dict[str, dict] = {}
 
 
