@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.log
+*.sqlite3
+
+# Virtual environment
+.venv/
+env/
+venv/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE / editor
+.vscode/
+.idea/
+
+# Node/web files (kalau ada web interface)
+node_modules/
+dist/
+build/
+*.env
+.env.*
+
+# yt-dlp & cache
+*.part
+*.ytdl
+__temp__/
+cache/
+

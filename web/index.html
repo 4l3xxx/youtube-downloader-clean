@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Personal YouTube Downloader</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="wrap">
+    <h1>Personal YouTube Downloader</h1>
+    <div class="card">
+      <label for="url">YouTube URL</label>
+      <input id="url" type="url" placeholder="https://www.youtube.com/watch?v=..." autofocus />
+
+      <label for="quality">Quality</label>
+      <select id="quality">
+        <option value="2160">2160p (4K)</option>
+        <option value="1440">1440p (2K)</option>
+        <option value="1080" selected>1080p</option>
+        <option value="720">720p</option>
+        <option value="480">480p</option>
+        <option value="360">360p</option>
+        <option value="240">240p</option>
+        <option value="144">144p</option>
+      </select>
+
+      <button id="btn">Download</button>
+      <div id="status" class="status"></div>
+      <div id="saved" class="saved"></div>
+      <div class="progress" id="progress" hidden>
+        <div class="bar" id="bar" style="width:0%"></div>
+        <div class="meta" id="meta">0% — ETA --s — -- MB/s</div>
+      </div>
+      <details id="errbox" class="errbox">
+        <summary>Show error details</summary>
+        <pre id="log" class="log"></pre>
+      </details>
+    </div>
+
+    <div class="card health">
+      <div class="health-row">
+        <span class="pill" id="yt-pill">yt-dlp</span>
+        <span class="pill" id="ff-pill">ffmpeg</span>
+        <button id="refresh" class="mini">Refresh status</button>
+      </div>
+      <div class="muted" id="dlpath">Downloads folder: -</div>
+      <div class="muted" id="ffloc">FFmpeg: (unknown)</div>
+    </div>
+
+    <footer>
+      <small>Powered by yt-dlp + ffmpeg — local only, no ads.</small>
+    </footer>
+  </div>
+
+  <script src="script.js"></script>
+  </body>
+  </html>
