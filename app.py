@@ -103,6 +103,32 @@ def yt_dlp_cmd():
     return None
 
 
+def to_mp4_aac(src_path: str) -> str:
+    """Convert a downloaded media file to MP4 with AAC audio while copying video.
+    Returns destination path if conversion succeeds, otherwise returns the original path.
+    """
+    try:
+        src = Path(src_path)
+        if not src.exists():
+            return src_path
+        dst = str(src.with_suffix('.mp4'))
+        # If already .mp4, write to .aac.mp4 to avoid clobbering in-use file
+        if src.suffix.lower() == '.mp4':
+            dst = str(src.with_suffix('')) + '.aac.mp4'
+        cmd = [
+            "ffmpeg", "-y", "-i", str(src),
+            "-map", "0:v:0", "-map", "0:a:0",
+            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+            "-movflags", "+faststart", dst
+        ]
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        if r.returncode == 0 and Path(dst).exists() and Path(dst).stat().st_size > 0:
+            return dst
+        return src_path
+    except Exception:
+        return src_path
+
+
 app = Flask(__name__, static_folder="web", static_url_path="/")
 CORS(app, resources={r"/*": {"origins": "*"}})
 
@@ -223,7 +249,9 @@ def download():
                 info = d.get("info_dict") or {}
                 fp = info.get("filepath") or info.get("_filename")
                 if fp:
-                    t["file"] = fp
+                    # Convert to MP4 + AAC to avoid Opus playback issues
+                    conv = to_mp4_aac(fp)
+                    t["file"] = conv
                 t["progress"] = 100
 
         def run():
@@ -308,17 +336,19 @@ def download():
     if not fp or not os.path.exists(fp):
         return {"ok": False, "error": "Download finished but file not found."}, 500
 
-    basename = os.path.basename(fp)
+    # Normalize to MP4 + AAC for compatibility
+    final_fp = to_mp4_aac(fp)
+    basename = os.path.basename(final_fp)
 
     @after_this_request
     def _cleanup(resp):
         try:
-            os.remove(fp)
+            os.remove(final_fp)
         except Exception:
             pass
         return resp
 
-    return send_file(fp, as_attachment=True, download_name=basename, mimetype="video/mp4", conditional=True)
+    return send_file(final_fp, as_attachment=True, download_name=basename, mimetype="video/mp4", conditional=True)
 
 
 @app.post("/api/upload_cookies")
@@ -360,12 +390,13 @@ def api_result():
     fp = t.get("file")
     if not fp or not os.path.exists(fp):
         return {"ok": False, "error": "file not found"}, 404
-    basename = os.path.basename(fp)
+    final_fp = to_mp4_aac(fp)
+    basename = os.path.basename(final_fp)
 
     @after_this_request
     def _cleanup(resp):
         try:
-            os.remove(fp)
+            os.remove(final_fp)
         except Exception:
             pass
         try:
@@ -374,7 +405,7 @@ def api_result():
             pass
         return resp
 
-    return send_file(fp, as_attachment=True, download_name=basename, mimetype="video/mp4", conditional=True)
+    return send_file(final_fp, as_attachment=True, download_name=basename, mimetype="video/mp4", conditional=True)
 
 
 @app.get("/dl")
