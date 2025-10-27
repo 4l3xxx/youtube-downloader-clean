@@ -9,6 +9,8 @@ from flask import Flask, jsonify, request, send_from_directory, send_file, after
 from flask_cors import CORS
 import threading
 import time
+import tempfile
+from yt_dlp import YoutubeDL
 
 
 def resolve_download_dir() -> Path:
@@ -137,174 +139,54 @@ def health():
     })
 
 
-@app.route("/api/download", methods=["POST", "OPTIONS"])
-def api_download():
-    if request.method == "OPTIONS":
-        return ("", 204)
-    # Accept JSON body or form fields
-    data = request.get_json(silent=True) if request.is_json else None
-    url = (data.get("url") if isinstance(data, dict) else request.values.get("url") or "").strip()
-    quality = str((data.get("quality") if isinstance(data, dict) else request.values.get("quality") or "1080")).strip()
-    use_async = bool((data.get("async") if isinstance(data, dict) else request.values.get("async")))
+@app.route("/api/download", methods=["POST"])
+def download():
+    data = request.get_json()
+    url = data["url"]
+    quality = (data.get("quality") or "1080p").rstrip("p")
 
-    if not url:
-        return jsonify({"ok": False, "error": "URL is required"}), 400
+    tmpdir = os.path.join(tempfile.gettempdir(), "ytdl")
+    os.makedirs(tmpdir, exist_ok=True)
 
-    base = yt_dlp_cmd()
-    if not base:
-        return jsonify({"ok": False, "error": "yt-dlp not installed (binary or Python module)"}), 500
+    final = {"path": None}
 
-    # For merged MP4 output, require ffmpeg to avoid separate audio/video files
-    ffmpeg_ok, ffmpeg_loc = resolve_ffmpeg()
-    if not ffmpeg_ok:
-        return jsonify({"ok": False, "error": "ffmpeg not detected. Install ffmpeg so video+audio can be merged into one MP4."}), 400
+    def pp_hook(d):
+        if d.get("status") == "finished":
+            info = d.get("info_dict") or {}
+            final["path"] = info.get("filepath")
 
-    # Normalize quality -> height
-    qmap = {"2160": 2160, "1440": 1440, "1080": 1080, "720": 720, "480": 480, "360": 360, "240": 240, "144": 144}
-    height = qmap.get(quality, 1080)
+    ydl_opts = {
+        "paths": {"home": tmpdir},
+        "outtmpl": {"default": "%(title)s [%(id)s].%(ext)s"},
+        "restrictfilenames": True,
+        "merge_output_format": "mp4",
+        "format": f"bestvideo[height<={quality}]+bestaudio/best",
+        "postprocessor_hooks": [pp_hook],
+    }
 
-    dl_dir = resolve_download_dir()
-    dl_dir.mkdir(parents=True, exist_ok=True)
+    with YoutubeDL(ydl_opts) as ydl:
+        ydl.extract_info(url, download=True)
 
-    fmt = f"bv*[ext=mp4][height<={height}]+ba[ext=m4a]/bv*[height<={height}]+ba/b[ext=mp4][height<={height}]/b[height<={height}]"
-    out_tmpl = str(dl_dir / "%(title)s [%(resolution)s]-%(id)s.%(ext)s")
+    fp = final["path"]
+    if not fp or not os.path.exists(fp):
+        cand = sorted(
+            (os.path.join(tmpdir, f) for f in os.listdir(tmpdir)),
+            key=os.path.getmtime, reverse=True
+        )
+        fp = next((p for p in cand if p.lower().endswith((".mp4", ".mkv", ".webm"))), None)
 
-    cmd = base + [
-        "--no-playlist",
-        "-f", fmt,
-        "--remux-video", "mp4",
-        "--merge-output-format", "mp4",
-        "-o", out_tmpl,
-        url,
-    ]
+    if not fp or not os.path.exists(fp):
+        return {"ok": False, "error": "Download finished but file not found."}, 500
 
-    # Async mode using yt_dlp Python API with progress (returns JSON)
-    if use_async:
-        try:
-            import yt_dlp
-        except Exception as e:
-            return jsonify({"ok": False, "error": f"yt-dlp module not available: {e}"}), 500
+    basename = os.path.basename(fp)
 
-        task_id = str(int(time.time()*1000))
-        TASKS[task_id] = {
-            "status": "starting",
-            "progress": 0,
-            "eta": None,
-            "speed": None,
-            "title": None,
-            "log": "",
-            "download_dir": str(dl_dir),
-        }
+    @after_this_request
+    def _cleanup(resp):
+        try: os.remove(fp)
+        except Exception: pass
+        return resp
 
-        def hook(d):
-            t = TASKS.get(task_id)
-            if not t:
-                return
-            t["status"] = d.get("status", t["status"]) or t["status"]
-            if d.get("status") == "downloading":
-                total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-                downloaded = d.get("downloaded_bytes") or 0
-                pct = int(downloaded * 100 / total) if total else 0
-                t["progress"] = pct
-                t["eta"] = d.get("eta")
-                t["speed"] = d.get("speed")
-                t["title"] = d.get("info_dict", {}).get("title") or t["title"]
-            if d.get("status") == "finished":
-                t["progress"] = 100
-                t["eta"] = 0
-
-        def run():
-            fmt_local = fmt
-            out_local = out_tmpl
-            yopts = {
-                "noplaylist": True,
-                "format": fmt_local,
-                "outtmpl": out_local,
-                "merge_output_format": "mp4",
-                "postprocessors": [
-                    {"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"}
-                ],
-                "progress_hooks": [hook],
-                # Reduce console noise
-                "quiet": True,
-                "no_warnings": True,
-            }
-            try:
-                with yt_dlp.YoutubeDL(yopts) as ydl:
-                    ydl.download([url])
-                TASKS[task_id]["status"] = "completed"
-            except Exception as e:
-                TASKS[task_id]["status"] = "error"
-                TASKS[task_id]["log"] = str(e)
-
-        threading.Thread(target=run, daemon=True).start()
-        return jsonify({"ok": True, "task_id": task_id, "download_dir": str(dl_dir)})
-
-    # File-returning mode: download to temp/ then stream file to client and delete
-    try:
-        temp_dir = Path.cwd() / "temp"
-        temp_dir.mkdir(parents=True, exist_ok=True)
-
-        # Prefer MP4; final naming will be captured via hook
-        fmt_local = fmt
-        out_tmpl = str(temp_dir / "%(title)s [%(resolution)s]-%(id)s.%(ext)s")
-
-        final_path_holder: dict[str, str | None] = {"path": None}
-
-        def hook(d):
-            if d.get("status") == "finished":
-                # yt-dlp sets 'filename' to the final file after postprocessing
-                fp = d.get("filename") or d.get("info_dict", {}).get("_filename")
-                if fp:
-                    final_path_holder["path"] = fp
-
-        try:
-            import yt_dlp  # type: ignore
-        except Exception as e:
-            return jsonify({"ok": False, "error": f"yt-dlp module not available: {e}"}), 500
-
-        yopts: dict = {
-            "noplaylist": True,
-            "format": fmt_local,
-            "outtmpl": out_tmpl,
-            "merge_output_format": "mp4",
-            "postprocessors": [
-                {"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"}
-            ],
-            "progress_hooks": [hook],
-            "quiet": True,
-            "no_warnings": True,
-        }
-        if ffmpeg_loc:
-            yopts["ffmpeg_location"] = ffmpeg_loc
-
-        with yt_dlp.YoutubeDL(yopts) as ydl:
-            ydl.download([url])
-
-        # Determine the final path
-        final_path = final_path_holder.get("path")
-        if not final_path:
-            # Fallback: pick the most recent file in temp_dir
-            cand = sorted(temp_dir.glob("*"), key=lambda p: p.stat().st_mtime, reverse=True)
-            final_path = str(cand[0]) if cand else None
-
-        if not final_path or not Path(final_path).exists():
-            return jsonify({"ok": False, "error": "Download finished but file not found."}), 500
-
-        dl_name = Path(final_path).name
-
-        @after_this_request
-        def _cleanup(resp):
-            try:
-                Path(final_path).unlink(missing_ok=True)
-            except Exception:
-                pass
-            return resp
-
-        # Send as attachment so the browser/WebView saves to Downloads
-        return send_file(final_path, as_attachment=True, download_name=dl_name, mimetype="video/mp4")
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+    return send_file(fp, as_attachment=True, download_name=basename, mimetype="video/mp4", conditional=True)
 
 
 @app.get("/dl")
