@@ -6,6 +6,9 @@ import sys
 import importlib.util
 from pathlib import Path
 from flask import Flask, jsonify, request, send_from_directory, send_file, after_this_request
+import io
+import zipfile
+import textwrap
 from werkzeug.utils import secure_filename
 from flask_cors import CORS
 import threading
@@ -406,6 +409,101 @@ def api_result():
         return resp
 
     return send_file(final_fp, as_attachment=True, download_name=basename, mimetype="video/mp4", conditional=True)
+
+
+# ---------- Helper ZIP generators ----------
+def _windows_bat() -> str:
+    return textwrap.dedent(r"""
+    @echo off
+    setlocal EnableExtensions EnableDelayedExpansion
+    title YouTube Downloader Helper (Windows)
+
+    where yt-dlp >nul 2>&1
+    if errorlevel 1 (
+      echo [INFO] yt-dlp not found in PATH. Attempting to download locally...
+      powershell -NoProfile -Command "try { Invoke-WebRequest -Uri https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe -OutFile yt-dlp.exe -UseBasicParsing } catch { exit 1 }"
+    )
+
+    where ffmpeg >nul 2>&1
+    if errorlevel 1 (
+      echo [WARN] ffmpeg not found. Trying winget (requires Windows 10/11):
+      winget install -e --id Gyan.FFmpeg || echo Install ffmpeg via winget/choco or add to PATH.
+    )
+
+    set /p URL="Paste YouTube URL: "
+    if "%URL%"=="" (
+      echo No URL provided. Exiting.
+      pause
+      exit /b 1
+    )
+    echo Downloading with browser cookies (Chrome)...
+    yt-dlp --cookies-from-browser chrome --recode-video mp4 --postprocessor-args "ffmpeg:-c:v copy -c:a aac -b:a 192k -movflags +faststart" "%URL%"
+    echo.
+    echo Done. If cookies fail, close Chrome and try again or export cookies.txt.
+    pause
+    """)
+
+
+def _posix_sh() -> str:
+    return textwrap.dedent(r"""
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "YouTube Downloader Helper (macOS/Linux)"
+    # Check deps
+    if ! command -v yt-dlp >/dev/null 2>&1; then
+      echo "[INFO] yt-dlp not found. Try:"
+      echo "  macOS: brew install yt-dlp ffmpeg"
+      echo "  Ubuntu/Debian: sudo apt-get install -y yt-dlp ffmpeg"
+      echo "  Arch: sudo pacman -S yt-dlp ffmpeg"
+    fi
+    if ! command -v ffmpeg >/dev/null 2>&1; then
+      echo "[WARN] ffmpeg not found. Install ffmpeg for conversion to MP4/AAC."
+    fi
+    read -r -p "Paste YouTube URL: " URL
+    if [[ -z "${URL}" ]]; then echo "No URL provided"; exit 1; fi
+    echo "Downloading with browser cookies (Chrome)..."
+    yt-dlp --cookies-from-browser chrome --recode-video mp4 --postprocessor-args "ffmpeg:-c:v copy -c:a aac -b:a 192k -movflags +faststart" "${URL}"
+    echo "Done. If cookies fail, close the browser first or export cookies.txt."
+    """)
+
+
+def _helper_readme() -> str:
+    return textwrap.dedent(r"""
+    Quick Helper
+    ============
+
+    1) Unzip this package to a folder you trust (e.g., Desktop)
+    2) Windows: double‑click download-win.bat
+       macOS/Linux: open Terminal → cd to folder → chmod +x download.sh → ./download.sh
+    3) Paste a YouTube URL when prompted
+
+    Notes
+    -----
+    - Uses your local browser cookies (--cookies-from-browser chrome) so you stay signed in
+    - Close the browser if cookies are locked and try again
+    - Output is normalized to MP4 + AAC for maximum compatibility
+    - Files save to the current folder by default (or your Downloads, depending on shell)
+    """)
+
+
+@app.get("/api/helper/windows.zip")
+def helper_windows_zip():
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as z:
+        z.writestr("README.txt", _helper_readme())
+        z.writestr("download-win.bat", _windows_bat())
+    buf.seek(0)
+    return send_file(buf, as_attachment=True, download_name="helper-windows.zip", mimetype="application/zip")
+
+
+@app.get("/api/helper/macos.zip")
+def helper_macos_zip():
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as z:
+        z.writestr("README.txt", _helper_readme())
+        z.writestr("download.sh", _posix_sh())
+    buf.seek(0)
+    return send_file(buf, as_attachment=True, download_name="helper-macos-linux.zip", mimetype="application/zip")
 
 
 @app.get("/dl")
